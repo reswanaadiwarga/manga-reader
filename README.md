@@ -1,0 +1,42 @@
+# Manga Reader
+
+A simple Android PDF reader for manga and manhwa, built on top of the official
+[MuPDF](https://mupdf.com/) rendering library (not a fork).
+
+Version: 1.2.1
+
+## Features
+
+- Folder library via SAF: pick a root folder once; browse nested series folders
+- Continuous vertical scrolling, fitted to screen width
+- Auto-hiding top bar with chapter filename and page counter
+  (scroll to show, single tap to toggle, double tap still zooms)
+- Previous / Next chapter actions at the end of a chapter
+- Remembers the last page per PDF; manual open resumes, chapter navigation
+  starts at page 1
+- Pinch-to-zoom, pan, and double-tap 1x/2x, with resolution-aware re-rendering
+- Right-edge drag scrollbar for fast navigation
+- No INTERNET permission and no analytics; reading progress stays on-device
+
+## Build
+
+Requirements: JDK 17+, Android SDK 36.
+
+```powershell
+.\gradlew.bat :app:assembleDebug
+```
+
+The APK is written to `app/build/outputs/apk/debug/app-debug.apk`.
+
+- minSdk 26 (Android 8.0+)
+- MuPDF `com.artifex.mupdf:fitz:1.28.5` is resolved from
+  `https://maven.ghostscript.com/`
+
+## License
+
+This project is licensed under the GNU Affero General Public License v3.0;
+see [LICENSE](LICENSE).
+
+It uses MuPDF, Copyright (c) Artifex Software, Inc., also licensed under
+AGPL-3.0. MuPDF source is available from
+https://github.com/ArtifexSoftware/mupdf.
