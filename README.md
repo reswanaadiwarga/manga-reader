@@ -5,6 +5,21 @@ A simple Android PDF reader for manga and manhwa, built on top of the official
 
 Version: 1.2.1
 
+## Download
+
+**[Download the latest APK](https://github.com/reswanaadiwarga/manga-reader/releases/latest)**
+(Android 8.0+)
+
+Each release includes the APK and the corresponding source archives
+(AGPL-3.0).
+
+### Install
+
+1. Open the latest release and download `MangaReader-<version>.apk`.
+2. Allow installation from unknown apps if prompted.
+3. Play Protect may warn because the APK is debug-signed and not distributed
+   through Google Play; choose "Install anyway".
+
 ## Features
 
 - Folder library via SAF: pick a root folder once; browse nested series folders
