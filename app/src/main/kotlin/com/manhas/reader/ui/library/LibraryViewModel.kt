@@ -6,6 +6,7 @@ import android.content.Intent
 import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.manhas.reader.data.LastReadStore
 import com.manhas.reader.data.LibraryEntry
 import com.manhas.reader.data.LibraryRepository
 import kotlinx.coroutines.Dispatchers
@@ -26,11 +27,13 @@ data class LibraryUiState(
   val entries: List<LibraryEntry> = emptyList(),
   val loading: Boolean = false,
   val error: String? = null,
+  val lastReadDocumentHash: String? = null,
 )
 
 class LibraryViewModel(private val app: Application) : ViewModel() {
   private val prefs = app.getSharedPreferences("library", Context.MODE_PRIVATE)
   private val repository = LibraryRepository(app.contentResolver)
+  private val lastReadStore = LastReadStore(app)
   private val _uiState = MutableStateFlow(LibraryUiState())
   val uiState: StateFlow<LibraryUiState> = _uiState.asStateFlow()
   private val scrollPositions = mutableMapOf<String, ScrollPosition>()
@@ -81,6 +84,16 @@ class LibraryViewModel(private val app: Application) : ViewModel() {
     scrollPositions[documentId] = ScrollPosition(index, offset)
   }
 
+  fun refreshLastRead() {
+    val state = _uiState.value
+    val root = state.rootUri ?: return
+    val folder = state.crumbs.lastOrNull() ?: return
+    val hash = lastReadStore.documentHash(root.toString(), folder.documentId)
+    if (hash != state.lastReadDocumentHash) {
+      _uiState.update { it.copy(lastReadDocumentHash = hash) }
+    }
+  }
+
   private fun restoreRoot() {
     val stored = prefs.getString(KEY_ROOT, null) ?: return
     val uri = Uri.parse(stored)
@@ -115,6 +128,10 @@ class LibraryViewModel(private val app: Application) : ViewModel() {
               entries = it,
               loading = false,
               error = null,
+              lastReadDocumentHash = lastReadStore.documentHash(
+                treeUri.toString(),
+                folder.documentId,
+              ),
             )
           },
           onFailure = {

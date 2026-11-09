@@ -42,10 +42,13 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -83,6 +86,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.manhas.reader.Reader
 import androidx.compose.foundation.isSystemInDarkTheme
+import com.manhas.reader.util.PageRotation
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -154,10 +158,19 @@ fun ReaderScreen(
         if (pageCount == 0) 0 else (listState.firstVisibleItemIndex + 1).coerceAtMost(pageCount)
       }
     }
+    // Native page ratios are converted to display ratios after user rotation,
+    // so item heights, offsets and the scrollbar all follow the visible shape.
+    val displayRatios = remember(state.pageRatios, state.pageRotations) {
+      state.pageRatios.mapIndexed { index, ratio ->
+        PageRotation.displayRatio(ratio, state.pageRotations.getOrElse(index) { 0 })
+      }
+    }
+    var rotationAnchorPage by remember { mutableStateOf<Int?>(null) }
+    var rotateMenuOpen by remember { mutableStateOf(false) }
     val bottomInset = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
-    val pageOffsets = remember(state.pageRatios, widthPx) {
-      val offsets = IntArray(state.pageRatios.size + 1)
-      state.pageRatios.forEachIndexed { index, ratio ->
+    val pageOffsets = remember(displayRatios, widthPx) {
+      val offsets = IntArray(displayRatios.size + 1)
+      displayRatios.forEachIndexed { index, ratio ->
         offsets[index + 1] = offsets[index] + (widthPx * ratio).roundToInt()
       }
       offsets
@@ -179,20 +192,30 @@ fun ReaderScreen(
     LaunchedEffect(state.documentToken) {
       zoom.reset()
       renderScale = 1f
+      rotationAnchorPage = null
+      rotateMenuOpen = false
       if (state.pageRatios.isNotEmpty()) {
-        chrome.scheduleHide()
+        chrome.showBriefly()
         val page = state.initialPage.coerceIn(0, state.pageRatios.lastIndex)
         listState.scrollToItem(page)
         viewModel.onPageVisible(page)
       }
     }
+    // Rotation changes page heights, which would otherwise leave the list at a
+    // pixel offset that points at a different page. Re-anchor explicitly.
+    LaunchedEffect(state.rotationRevision) {
+      if (state.rotationRevision == 0) return@LaunchedEffect
+      val page = rotationAnchorPage ?: return@LaunchedEffect
+      rotationAnchorPage = null
+      if (state.pageRatios.isNotEmpty()) {
+        val target = page.coerceIn(0, state.pageRatios.lastIndex)
+        listState.scrollToItem(target)
+        viewModel.onPageVisible(target)
+      }
+    }
     LaunchedEffect(listState, chrome) {
       snapshotFlow { listState.isScrollInProgress }.collect { scrolling ->
-        if (scrolling) {
-          chrome.showWhileScrolling()
-        } else {
-          chrome.scheduleHide()
-        }
+        if (scrolling && !rotateMenuOpen) chrome.hide()
       }
     }
     LaunchedEffect(zoom.scale) {
@@ -226,6 +249,19 @@ fun ReaderScreen(
       }
     }
 
+    fun applyRotation(action: (Int) -> Unit) {
+      if (state.pageRatios.isEmpty()) return
+      val page = listState.firstVisibleItemIndex.coerceIn(0, state.pageRatios.lastIndex)
+      rotationAnchorPage = page
+      action(page)
+    }
+
+    fun applyResetRotation() {
+      if (state.pageRatios.isEmpty()) return
+      rotationAnchorPage = listState.firstVisibleItemIndex.coerceIn(0, state.pageRatios.lastIndex)
+      viewModel.resetRotation()
+    }
+
     Box(
       modifier = Modifier
         .fillMaxSize()
@@ -245,10 +281,11 @@ fun ReaderScreen(
         userScrollEnabled = !zoomed,
         contentPadding = PaddingValues(bottom = bottomInset + 16.dp),
       ) {
-        itemsIndexed(state.pageRatios) { index, ratio ->
+        itemsIndexed(displayRatios) { index, ratio ->
           ReaderPage(
             index = index,
             ratio = ratio,
+            rotation = state.pageRotations.getOrElse(index) { 0 },
             widthDp = widthDp,
             renderWidthPx = renderWidthPx,
             documentToken = state.documentToken,
@@ -328,6 +365,54 @@ fun ReaderScreen(
             color = Color(0xFFBDBDBD),
             style = MaterialTheme.typography.bodySmall,
           )
+          Spacer(modifier = Modifier.width(4.dp))
+          Box {
+            TextButton(
+              onClick = {
+                rotateMenuOpen = true
+                chrome.hold()
+              },
+              contentPadding = PaddingValues(horizontal = 8.dp),
+            ) {
+              Text(
+                text = "Rotate",
+                color = Color.White,
+                style = MaterialTheme.typography.labelLarge,
+              )
+            }
+            DropdownMenu(
+              expanded = rotateMenuOpen,
+              onDismissRequest = {
+                rotateMenuOpen = false
+                chrome.showBriefly()
+              },
+            ) {
+              DropdownMenuItem(
+                text = { Text("Rotate this page") },
+                onClick = {
+                  rotateMenuOpen = false
+                  chrome.showBriefly()
+                  applyRotation(viewModel::rotateCurrentPage)
+                },
+              )
+              DropdownMenuItem(
+                text = { Text("Rotate all pages") },
+                onClick = {
+                  rotateMenuOpen = false
+                  chrome.showBriefly()
+                  applyRotation(viewModel::rotateAllPages)
+                },
+              )
+              DropdownMenuItem(
+                text = { Text("Reset rotation") },
+                onClick = {
+                  rotateMenuOpen = false
+                  chrome.showBriefly()
+                  applyResetRotation()
+                },
+              )
+            }
+          }
         }
       }
     }
@@ -483,14 +568,15 @@ private fun ReaderScrollbar(
 private fun ReaderPage(
   index: Int,
   ratio: Float,
+  rotation: Int,
   widthDp: Dp,
   renderWidthPx: Int,
   documentToken: Int,
-  render: suspend (Int, Int) -> Bitmap?,
+  render: suspend (Int, Int, Int) -> Bitmap?,
 ) {
-  var bitmap by remember(index, documentToken) { mutableStateOf<Bitmap?>(null) }
-  LaunchedEffect(index, renderWidthPx, documentToken) {
-    val next = render(index, renderWidthPx)
+  var bitmap by remember(index, documentToken, rotation) { mutableStateOf<Bitmap?>(null) }
+  LaunchedEffect(index, renderWidthPx, documentToken, rotation) {
+    val next = render(index, renderWidthPx, rotation)
     if (next != null) {
       bitmap = next
     }
@@ -508,7 +594,7 @@ private fun ReaderPage(
         bitmap = rendered.asImageBitmap(),
         contentDescription = "Page ${index + 1}",
         modifier = Modifier.fillMaxSize(),
-        contentScale = ContentScale.FillWidth,
+        contentScale = ContentScale.Fit,
       )
     } else {
       Box(
@@ -613,12 +699,7 @@ private class ChromeController(private val scope: CoroutineScope) {
     private set
   private var hideJob: Job? = null
 
-  fun showWhileScrolling() {
-    hideJob?.cancel()
-    visible = true
-  }
-
-  fun scheduleHide() {
+  fun showBriefly() {
     hideJob?.cancel()
     visible = true
     hideJob = scope.launch {
@@ -627,12 +708,22 @@ private class ChromeController(private val scope: CoroutineScope) {
     }
   }
 
+  /** Shows the bar without scheduling auto-hide, e.g. while a menu is open. */
+  fun hold() {
+    hideJob?.cancel()
+    visible = true
+  }
+
+  fun hide() {
+    hideJob?.cancel()
+    visible = false
+  }
+
   fun toggle() {
     if (visible) {
-      hideJob?.cancel()
-      visible = false
+      hide()
     } else {
-      scheduleHide()
+      showBriefly()
     }
   }
 

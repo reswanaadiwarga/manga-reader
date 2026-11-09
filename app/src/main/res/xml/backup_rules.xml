@@ -1,5 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <full-backup-content>
     <exclude domain="sharedpref" path="progress.xml" />
+    <exclude domain="sharedpref" path="last_read.xml" />
     <exclude domain="sharedpref" path="library.xml" />
+    <exclude domain="sharedpref" path="rotation.xml" />
 </full-backup-content>

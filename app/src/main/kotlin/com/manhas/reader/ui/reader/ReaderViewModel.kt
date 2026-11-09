@@ -6,10 +6,14 @@ import android.net.Uri
 import android.util.LruCache
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.manhas.reader.data.LastReadStore
 import com.manhas.reader.data.LibraryEntry
 import com.manhas.reader.data.LibraryRepository
 import com.manhas.reader.data.MuPdfSession
 import com.manhas.reader.data.ProgressStore
+import com.manhas.reader.data.RotationSettings
+import com.manhas.reader.data.RotationStore
+import com.manhas.reader.util.PageRotation
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -24,6 +28,8 @@ data class ReaderUiState(
   val loading: Boolean = true,
   val error: String? = null,
   val pageRatios: List<Float> = emptyList(),
+  val pageRotations: List<Int> = emptyList(),
+  val rotationRevision: Int = 0,
   val previousTitle: String? = null,
   val nextTitle: String? = null,
   val initialPage: Int = 0,
@@ -34,6 +40,8 @@ class ReaderViewModel(private val app: Application) : ViewModel() {
   private val repository = LibraryRepository(app.contentResolver)
   private val session = MuPdfSession(app.contentResolver)
   private val progressStore = ProgressStore(app)
+  private val lastReadStore = LastReadStore(app)
+  private val rotationStore = RotationStore(app)
   private val _uiState = MutableStateFlow(ReaderUiState())
   val uiState: StateFlow<ReaderUiState> = _uiState.asStateFlow()
 
@@ -45,6 +53,8 @@ class ReaderViewModel(private val app: Application) : ViewModel() {
   private var openJob: Job? = null
   private var started = false
   private var lastVisiblePage = 0
+  private var documentRotation = 0
+  private var pageOverrides: Map<Int, Int> = emptyMap()
 
   private val cache = object : LruCache<String, Bitmap>(cacheSizeBytes()) {
     override fun sizeOf(key: String, value: Bitmap): Int = value.byteCount
@@ -87,6 +97,63 @@ class ReaderViewModel(private val app: Application) : ViewModel() {
     lastVisiblePage = page.coerceAtLeast(0)
   }
 
+  /**
+   * Advances [page] by one clockwise quarter turn and stores the result as a
+   * per-page override. No-op until the document has page ratios.
+   */
+  fun rotateCurrentPage(page: Int) {
+    val state = _uiState.value
+    if (page !in state.pageRotations.indices) return
+    val next = PageRotation.next(state.pageRotations[page])
+    pageOverrides = if (next == documentRotation) {
+      pageOverrides - page
+    } else {
+      pageOverrides + (page to next)
+    }
+    persistRotation()
+    publishRotation()
+  }
+
+  /**
+   * Advances the document default by one clockwise quarter turn relative to
+   * [page]'s applied rotation, then drops every page override.
+   */
+  fun rotateAllPages(page: Int) {
+    val state = _uiState.value
+    if (state.pageRatios.isEmpty()) return
+    val applied = state.pageRotations.getOrNull(page) ?: documentRotation
+    documentRotation = PageRotation.next(applied)
+    pageOverrides = emptyMap()
+    persistRotation()
+    publishRotation()
+  }
+
+  /** Restores the unrotated document default and clears page overrides. */
+  fun resetRotation() {
+    documentRotation = 0
+    pageOverrides = emptyMap()
+    persistRotation()
+    publishRotation()
+  }
+
+  private fun persistRotation() {
+    val key = currentDocumentKey
+    if (key.isEmpty()) return
+    rotationStore.save(key, RotationSettings(documentRotation, pageOverrides))
+  }
+
+  private fun publishRotation() {
+    val state = _uiState.value
+    if (state.pageRatios.isEmpty()) return
+    val rotations = state.pageRatios.indices.map { index ->
+      PageRotation.applied(pageOverrides[index], documentRotation)
+    }
+    _uiState.value = state.copy(
+      pageRotations = rotations,
+      rotationRevision = state.rotationRevision + 1,
+    )
+  }
+
   fun saveProgressNow() {
     val key = currentDocumentKey
     val ratios = _uiState.value.pageRatios
@@ -94,10 +161,11 @@ class ReaderViewModel(private val app: Application) : ViewModel() {
     progressStore.save(key, lastVisiblePage.coerceIn(0, ratios.lastIndex))
   }
 
-  suspend fun renderPage(pageIndex: Int, widthPx: Int): Bitmap? {
-    val cacheKey = "$currentDocumentKey:$pageIndex:$widthPx"
+  suspend fun renderPage(pageIndex: Int, widthPx: Int, rotation: Int): Bitmap? {
+    val normalized = PageRotation.normalize(rotation)
+    val cacheKey = "$currentDocumentKey:$pageIndex:$widthPx:$normalized"
     cache.get(cacheKey)?.let { return it }
-    val bitmap = session.render(pageIndex, widthPx) ?: return null
+    val bitmap = session.render(pageIndex, widthPx, normalized) ?: return null
     cache.put(cacheKey, bitmap)
     return bitmap
   }
@@ -117,6 +185,8 @@ class ReaderViewModel(private val app: Application) : ViewModel() {
         documentToken = _uiState.value.documentToken,
       )
       cache.evictAll()
+      documentRotation = 0
+      pageOverrides = emptyMap()
       val uri = Uri.parse(documentUri)
       val resolver = app.contentResolver
       val result = runCatching {
@@ -127,6 +197,7 @@ class ReaderViewModel(private val app: Application) : ViewModel() {
         val mimeType = resolver.getType(uri)?.takeIf { it != "application/octet-stream" }
           ?: if (title.endsWith(".pdf", ignoreCase = true)) "application/pdf" else null
         val ratios = session.open(uri, size, mimeType)
+        val rotation = rotationStore.load(documentUri)
         val currentIndex = folderEntries.indexOfFirst { it.documentId == documentId }
         val previous = if (currentIndex > 0) folderEntries.getOrNull(currentIndex - 1) else null
         val next = if (currentIndex >= 0) folderEntries.getOrNull(currentIndex + 1) else null
@@ -141,15 +212,20 @@ class ReaderViewModel(private val app: Application) : ViewModel() {
           loading = false,
           error = null,
           pageRatios = ratios,
+          pageRotations = ratios.indices.map { rotation.appliedRotation(it) },
           previousTitle = previous?.name,
           nextTitle = next?.name,
           initialPage = initialPage,
           documentToken = _uiState.value.documentToken + 1,
-        ) to folderEntries
+        ) to (folderEntries to rotation)
       }
-      result.onSuccess { (state, entries) ->
+      result.onSuccess { (state, side) ->
+        val (entries, rotation) = side
         siblings = entries
         lastVisiblePage = state.initialPage
+        documentRotation = rotation.documentRotation
+        pageOverrides = rotation.pageOverrides
+        lastReadStore.record(tree.toString(), folderDocumentId, documentUri)
         _uiState.value = state
       }.onFailure { error ->
         _uiState.value = ReaderUiState(

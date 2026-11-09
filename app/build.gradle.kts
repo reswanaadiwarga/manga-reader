@@ -11,8 +11,8 @@ android {
     applicationId = "com.manhas.reader"
     minSdk = 26
     targetSdk = 36
-    versionCode = 4
-    versionName = "1.2.1"
+    versionCode = 6
+    versionName = "1.4.0"
   }
 
   buildTypes {

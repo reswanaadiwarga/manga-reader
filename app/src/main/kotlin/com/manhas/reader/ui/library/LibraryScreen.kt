@@ -17,12 +17,14 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -35,9 +37,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.manhas.reader.data.LibraryEntry
+import com.manhas.reader.util.ProgressKey
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -49,6 +55,15 @@ fun LibraryScreen(
   val state by viewModel.uiState.collectAsStateWithLifecycle()
   val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
     if (uri != null) viewModel.setRoot(uri)
+  }
+
+  val lifecycleOwner = LocalLifecycleOwner.current
+  DisposableEffect(lifecycleOwner) {
+    val observer = LifecycleEventObserver { _, event ->
+      if (event == Lifecycle.Event.ON_RESUME) viewModel.refreshLastRead()
+    }
+    lifecycleOwner.lifecycle.addObserver(observer)
+    onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
   }
 
   BackHandler(enabled = state.crumbs.size > 1) {
@@ -128,6 +143,10 @@ fun LibraryScreen(
             contentPadding = PaddingValues(vertical = 8.dp),
           ) {
             items(state.entries, key = { it.documentId }) { entry ->
+              val isLastRead = !entry.isDirectory &&
+                state.lastReadDocumentHash != null &&
+                remember(entry.uri) { ProgressKey.of(entry.uri.toString()) } ==
+                state.lastReadDocumentHash
               ListItem(
                 modifier = Modifier.clickable {
                   if (entry.isDirectory) {
@@ -153,6 +172,21 @@ fun LibraryScreen(
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.primary,
                   )
+                },
+                trailingContent = {
+                  if (isLastRead) {
+                    Surface(
+                      shape = RoundedCornerShape(50),
+                      color = MaterialTheme.colorScheme.primaryContainer,
+                      contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                    ) {
+                      Text(
+                        text = "Last read",
+                        style = MaterialTheme.typography.labelSmall,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                      )
+                    }
+                  }
                 },
               )
             }
