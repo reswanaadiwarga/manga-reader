@@ -9,21 +9,39 @@ import androidx.lifecycle.viewModelScope
 import com.manhas.reader.data.LastReadStore
 import com.manhas.reader.data.LibraryEntry
 import com.manhas.reader.data.LibraryRepository
+import com.manhas.reader.data.LibrarySearch
+import com.manhas.reader.data.LibrarySearchIndex
 import com.manhas.reader.data.ProgressStore
 import com.manhas.reader.data.ReadingState
 import com.manhas.reader.data.ReadingStateStore
+import com.manhas.reader.data.SearchDocument
 import com.manhas.reader.util.ProgressKey
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 data class FolderCrumb(val documentId: String, val name: String)
 
 data class ScrollPosition(val index: Int, val offset: Int)
+
+/**
+ * One library-wide search hit: the document entry to open, the folder that owns
+ * it (used as the reader's Next/Previous context), its display folder path and
+ * the progress hash that indexes the shared reading-state maps.
+ */
+data class SearchResult(
+  val entry: LibraryEntry,
+  val parentDocumentId: String,
+  val folderPath: String,
+  val hash: String,
+)
 
 data class LibraryUiState(
   val rootUri: Uri? = null,
@@ -36,6 +54,15 @@ data class LibraryUiState(
   val readingStates: Map<String, ReadingState> = emptyMap(),
   /** Saved page per document hash; zero-based, sourced from [ProgressStore]. */
   val savedPages: Map<String, Int> = emptyMap(),
+  /** True while the library-wide search bar is open over the current folder. */
+  val searchActive: Boolean = false,
+  val searchQuery: String = "",
+  /** Documents matching [searchQuery], natural-sorted by relative path. */
+  val searchResults: List<SearchResult> = emptyList(),
+  val searchLoading: Boolean = false,
+  val searchError: String? = null,
+  /** Last-read document hash per search result parent folder ID. */
+  val searchLastReadHashes: Map<String, String> = emptyMap(),
 )
 
 class LibraryViewModel(private val app: Application) : ViewModel() {
@@ -47,6 +74,9 @@ class LibraryViewModel(private val app: Application) : ViewModel() {
   private val _uiState = MutableStateFlow(LibraryUiState())
   val uiState: StateFlow<LibraryUiState> = _uiState.asStateFlow()
   private val scrollPositions = mutableMapOf<String, ScrollPosition>()
+  private var searchIndex: List<SearchDocument>? = null
+  private var indexJob: Job? = null
+  private var filterJob: Job? = null
 
   init {
     restoreRoot()
@@ -59,6 +89,10 @@ class LibraryViewModel(private val app: Application) : ViewModel() {
     )
     prefs.edit().putString(KEY_ROOT, uri.toString()).apply()
     scrollPositions.clear()
+    clearSearchState()
+    // Mark loading immediately so the stale previous root/crumbs cannot enable
+    // Search during the folder-display-name lookup before load() starts.
+    _uiState.update { it.copy(loading = true, error = null) }
     val rootId = repository.rootDocumentId(uri)
     viewModelScope.launch {
       val name = withContext(Dispatchers.IO) { repository.folderDisplayName(uri, rootId) }
@@ -74,6 +108,10 @@ class LibraryViewModel(private val app: Application) : ViewModel() {
 
   fun goUp(): Boolean {
     val state = _uiState.value
+    if (state.searchActive) {
+      closeSearch()
+      return true
+    }
     val root = state.rootUri ?: return false
     if (state.crumbs.size <= 1) return false
     load(root, state.crumbs.dropLast(1))
@@ -95,24 +133,103 @@ class LibraryViewModel(private val app: Application) : ViewModel() {
   }
 
   /**
+   * Opens library-wide search over the current root without navigating. The
+   * caller is expected to restore the folder list (and its scroll) on close.
+   *
+   * Refuses while a root is loading or errored: during [setRoot] the previous
+   * root's crumbs/entries are still visible, and starting a scan from that stale
+   * view would pair old document IDs with the new tree URI.
+   */
+  fun openSearch() {
+    val state = _uiState.value
+    if (state.rootUri == null || state.loading || state.error != null) return
+    _uiState.update {
+      it.copy(
+        searchActive = true,
+        searchQuery = "",
+        searchResults = emptyList(),
+        searchLoading = false,
+        searchError = null,
+        searchLastReadHashes = emptyMap(),
+      )
+    }
+  }
+
+  /**
+   * Closes search and cancels any in-flight index/filter work. The cached index
+   * is kept so reopening search is cheap; [refresh] and [setRoot] invalidate it.
+   */
+  fun closeSearch() {
+    cancelSearchJobs()
+    _uiState.update {
+      it.copy(
+        searchActive = false,
+        searchQuery = "",
+        searchResults = emptyList(),
+        searchLoading = false,
+        searchError = null,
+        searchLastReadHashes = emptyMap(),
+      )
+    }
+  }
+
+  /**
+   * Updates the query. A blank query cancels indexing/filtering; while the index
+   * is still building, new keystrokes only update the query so the build is not
+   * restarted. Once the index exists only the filter job is replaced.
+   */
+  fun setSearchQuery(query: String) {
+    val state = _uiState.value
+    if (!state.searchActive) return
+    _uiState.update { it.copy(searchQuery = query, searchError = null) }
+    if (query.isBlank()) {
+      cancelSearchJobs()
+      _uiState.update { it.copy(searchResults = emptyList(), searchLoading = false) }
+      return
+    }
+    val index = searchIndex
+    if (index != null) {
+      startFilter(index, query)
+    } else if (indexJob?.isActive != true) {
+      startIndex()
+    }
+  }
+
+  /** Rebuilds the index after an error; safe to call while a search is shown. */
+  fun retrySearch() {
+    val state = _uiState.value
+    if (!state.searchActive || state.searchQuery.isBlank()) return
+    invalidateSearchIndex()
+    _uiState.update { it.copy(searchError = null) }
+    startIndex()
+  }
+
+  /**
    * Reloads last-read and reading state for the current folder. Called on
    * ON_RESUME so progress, finished flags and the Continue card reflect what
-   * happened in the reader.
+   * happened in the reader. Also invalidates the search index, rebuilding it when
+   * search is open with a non-blank query.
    */
   fun refresh() {
     val state = _uiState.value
     val root = state.rootUri ?: return
-    val folder = state.crumbs.lastOrNull() ?: return
-    val hash = lastReadStore.documentHash(root.toString(), folder.documentId)
-    val snapshots = state.entries.filter { !it.isDirectory }.map(::snapshot)
-    _uiState.update {
-      it.copy(
-        lastReadDocumentHash = hash,
-        readingStates = snapshots.associate { snapshot -> snapshot.hash to snapshot.reading },
-        savedPages = snapshots.mapNotNull { snapshot ->
-          snapshot.savedPage?.let { page -> snapshot.hash to page }
-        }.toMap(),
-      )
+    invalidateSearchIndex()
+    val folder = state.crumbs.lastOrNull()
+    if (folder != null) {
+      val hash = lastReadStore.documentHash(root.toString(), folder.documentId)
+      val snapshots = state.entries.filter { !it.isDirectory }.map(::snapshot)
+      _uiState.update {
+        it.copy(
+          lastReadDocumentHash = hash,
+          readingStates = snapshots.associate { snapshot -> snapshot.hash to snapshot.reading },
+          savedPages = snapshots.mapNotNull { snapshot ->
+            snapshot.savedPage?.let { page -> snapshot.hash to page }
+          }.toMap(),
+        )
+      }
+    }
+    if (state.searchActive && state.searchQuery.isNotBlank()) {
+      startIndex()
     }
   }
 
@@ -126,6 +243,7 @@ class LibraryViewModel(private val app: Application) : ViewModel() {
     progressStore.clear(uri)
     readingStateStore.clear(uri)
     publishDocument(entry)
+    refreshSearchFilter()
   }
 
   /**
@@ -141,6 +259,7 @@ class LibraryViewModel(private val app: Application) : ViewModel() {
     }
     readingStateStore.markFinished(uri)
     publishDocument(entry)
+    refreshSearchFilter()
   }
 
   /**
@@ -229,6 +348,163 @@ class LibraryViewModel(private val app: Application) : ViewModel() {
       }
     }
   }
+
+  private fun clearSearchState() {
+    invalidateSearchIndex()
+    _uiState.update {
+      it.copy(
+        searchActive = false,
+        searchQuery = "",
+        searchResults = emptyList(),
+        searchLoading = false,
+        searchError = null,
+        searchLastReadHashes = emptyMap(),
+      )
+    }
+  }
+
+  private fun cancelSearchJobs() {
+    indexJob?.cancel()
+    indexJob = null
+    filterJob?.cancel()
+    filterJob = null
+  }
+
+  private fun invalidateSearchIndex() {
+    cancelSearchJobs()
+    searchIndex = null
+  }
+
+  /**
+   * Builds the recursive index on IO. The root listing error is surfaced as
+   * [LibraryUiState.searchError]; subfolder errors are swallowed by the index.
+   */
+  private fun startIndex() {
+    val state = _uiState.value
+    val root = state.rootUri ?: return
+    val rootId = state.crumbs.firstOrNull()?.documentId ?: return
+    indexJob?.cancel()
+    filterJob?.cancel()
+    searchIndex = null
+    indexJob = viewModelScope.launch {
+      _uiState.update { it.copy(searchLoading = true, searchError = null) }
+      try {
+        val documents = withContext(Dispatchers.IO) {
+          LibrarySearchIndex.build(
+            rootDocumentId = rootId,
+            listChildren = { folderId -> repository.searchNodes(root, folderId) },
+          )
+        }
+        // The scan is blocking and cannot be interrupted mid-query; drop its
+        // result if a newer root/refresh cancelled this job while it ran.
+        if (!isActive) return@launch
+        searchIndex = documents
+        val query = _uiState.value.searchQuery
+        if (_uiState.value.searchActive && query.isNotBlank()) {
+          startFilter(documents, query)
+        } else {
+          _uiState.update { it.copy(searchLoading = false) }
+        }
+      } catch (cancelled: CancellationException) {
+        throw cancelled
+      } catch (error: Exception) {
+        _uiState.update {
+          it.copy(
+            searchLoading = false,
+            searchError = error.message ?: "Cannot search library",
+          )
+        }
+      }
+    }
+  }
+
+  /**
+   * Re-runs the current filter after a mark-read/mark-unread, so an older
+   * in-flight hydration cannot land last and overwrite the just-updated
+   * progress/check state shown in the result rows.
+   */
+  private fun refreshSearchFilter() {
+    val state = _uiState.value
+    if (!state.searchActive || state.searchQuery.isBlank()) return
+    val index = searchIndex ?: return
+    startFilter(index, state.searchQuery)
+  }
+
+  /**
+   * Filters the cached index off the main thread and resolves reading state for
+   * the hits on IO. Only this job is replaced per keystroke; the index job keeps
+   * running so a quick typist does not restart the scan.
+   */
+  private fun startFilter(index: List<SearchDocument>, query: String) {
+    filterJob?.cancel()
+    filterJob = viewModelScope.launch {
+      val rootString = _uiState.value.rootUri?.toString() ?: return@launch
+      val filtered = withContext(Dispatchers.Default) {
+        index.filter { LibrarySearch.matches(query, it.searchText) }
+      }
+      val payload = withContext(Dispatchers.IO) {
+        val entries = filtered.map { document ->
+          SearchEntrySnapshot(
+            document = document,
+            hash = ProgressKey.of(document.uriString),
+            reading = readingStateStore.load(document.uriString),
+            savedPage = progressStore.pageFor(document.uriString),
+          )
+        }
+        val lastRead = filtered
+          .map { it.parentDocumentId }
+          .distinct()
+          .mapNotNull { parent ->
+            lastReadStore.documentHash(rootString, parent)?.let { parent to it }
+          }
+          .toMap()
+        SearchPayload(entries, lastRead)
+      }
+      // Drop results computed for a query/root that has since changed.
+      val current = _uiState.value
+      if (!current.searchActive || current.searchQuery != query) return@launch
+      val results = payload.entries.map { snapshot ->
+        SearchResult(
+          entry = LibraryEntry(
+            uri = Uri.parse(snapshot.document.uriString),
+            documentId = snapshot.document.documentId,
+            name = snapshot.document.name,
+            isDirectory = false,
+          ),
+          parentDocumentId = snapshot.document.parentDocumentId,
+          folderPath = snapshot.document.folderPath,
+          hash = snapshot.hash,
+        )
+      }
+      _uiState.update { state ->
+        val readingAdds = payload.entries
+          .filter { it.reading != ReadingState() }
+          .associate { it.hash to it.reading }
+        val savedAdds = payload.entries
+          .mapNotNull { snapshot -> snapshot.savedPage?.let { snapshot.hash to it } }
+          .toMap()
+        state.copy(
+          searchResults = results,
+          searchLoading = false,
+          searchLastReadHashes = payload.lastRead,
+          readingStates = state.readingStates + readingAdds,
+          savedPages = state.savedPages + savedAdds,
+        )
+      }
+    }
+  }
+
+  private data class SearchEntrySnapshot(
+    val document: SearchDocument,
+    val hash: String,
+    val reading: ReadingState,
+    val savedPage: Int?,
+  )
+
+  private data class SearchPayload(
+    val entries: List<SearchEntrySnapshot>,
+    val lastRead: Map<String, String>,
+  )
 
   private fun publishDocument(entry: LibraryEntry) {
     val snapshot = snapshot(entry)

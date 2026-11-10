@@ -3,7 +3,7 @@
 A simple Android manga and manhwa reader for PDF, CBZ and ZIP files, built on
 top of the official [MuPDF](https://mupdf.com/) rendering library (not a fork).
 
-Version: 1.6.0
+Version: 1.7.0
 
 ## Download
 
@@ -23,6 +23,8 @@ Each release includes the APK and the corresponding source archives
 ## Features
 
 - Folder library via SAF: pick a root folder once; browse nested series folders
+- Library-wide search by series or chapter name: case-insensitive, path-aware,
+  all words in any order; results open directly and keep chapter navigation
 - Continuous vertical scrolling, fitted to screen width
 - Reads PDF, CBZ and ZIP; CBZ/ZIP pages use Android image decoding
   (WebP, JPEG, PNG, GIF, BMP), natural-sorted

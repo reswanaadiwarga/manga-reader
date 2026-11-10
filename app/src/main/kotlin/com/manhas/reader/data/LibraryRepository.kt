@@ -53,6 +53,41 @@ class LibraryRepository(private val resolver: ContentResolver) {
   fun listDocuments(treeUri: Uri, documentId: String): List<LibraryEntry> =
     list(treeUri, documentId).filter { !it.isDirectory }
 
+  /**
+   * Lists [documentId]'s children as pure [SearchNode]s for the recursive search
+   * index. Unlike [list] this keeps the URI as a string so the index builder has
+   * no Android dependency; unsupported documents are still filtered out so
+   * search results stay PDF/CBZ/ZIP only.
+   *
+   * Throws if the provider query fails, which the index treats as fatal for the
+   * root and skippable for a child folder.
+   */
+  fun searchNodes(treeUri: Uri, documentId: String): List<SearchNode> {
+    val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, documentId)
+    val nodes = mutableListOf<SearchNode>()
+    val cursor = resolver.query(childrenUri, PROJECTION, null, null, null)
+      ?: throw IllegalStateException("Cannot list folder for search")
+    cursor.use {
+      val idColumn = it.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+      val nameColumn = it.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+      val mimeColumn = it.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE)
+      while (it.moveToNext()) {
+        val id = it.getString(idColumn) ?: continue
+        val name = it.getString(nameColumn) ?: continue
+        val mime = it.getString(mimeColumn)
+        val isDirectory = mime == DocumentsContract.Document.MIME_TYPE_DIR
+        if (!isDirectory && !DocumentFormats.isLibraryDocument(name, mime)) continue
+        nodes += SearchNode(
+          documentId = id,
+          name = name,
+          isDirectory = isDirectory,
+          uriString = DocumentsContract.buildDocumentUriUsingTree(treeUri, id).toString(),
+        )
+      }
+    }
+    return nodes
+  }
+
   fun documentSize(uri: Uri): Long {
     resolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use { cursor ->
       if (cursor.moveToFirst() && !cursor.isNull(0)) return cursor.getLong(0)
