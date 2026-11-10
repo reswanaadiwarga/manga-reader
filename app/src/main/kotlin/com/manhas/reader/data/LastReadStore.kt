@@ -15,6 +15,11 @@ class LastReadStore(context: Context) {
   fun documentHash(treeUri: String, folderDocumentId: String): String? =
     prefs.getString(folderKey(treeUri, folderDocumentId), null)
 
+  /** Forgets [folderDocumentId]'s last-read document, hiding its pill and Continue card. */
+  fun clear(treeUri: String, folderDocumentId: String) {
+    prefs.edit().remove(folderKey(treeUri, folderDocumentId)).apply()
+  }
+
   private fun folderKey(treeUri: String, folderDocumentId: String): String =
     "folder:" + ProgressKey.of("$treeUri|$folderDocumentId")
 }

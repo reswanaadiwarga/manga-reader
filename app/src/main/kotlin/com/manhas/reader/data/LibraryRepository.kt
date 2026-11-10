@@ -37,7 +37,7 @@ class LibraryRepository(private val resolver: ContentResolver) {
         val name = cursor.getString(nameColumn) ?: continue
         val mime = cursor.getString(mimeColumn)
         val isDirectory = mime == DocumentsContract.Document.MIME_TYPE_DIR
-        if (!isDirectory && !isPdf(name, mime)) continue
+        if (!isDirectory && !DocumentFormats.isLibraryDocument(name, mime)) continue
         entries += LibraryEntry(
           uri = DocumentsContract.buildDocumentUriUsingTree(treeUri, id),
           documentId = id,
@@ -49,7 +49,8 @@ class LibraryRepository(private val resolver: ContentResolver) {
     return entries.sortedWith(ENTRY_ORDER)
   }
 
-  fun listPdfs(treeUri: Uri, documentId: String): List<LibraryEntry> =
+  /** Lists the readable documents in [documentId], without folders. */
+  fun listDocuments(treeUri: Uri, documentId: String): List<LibraryEntry> =
     list(treeUri, documentId).filter { !it.isDirectory }
 
   fun documentSize(uri: Uri): Long {
@@ -58,9 +59,6 @@ class LibraryRepository(private val resolver: ContentResolver) {
     }
     return -1L
   }
-
-  private fun isPdf(name: String, mime: String?): Boolean =
-    mime == "application/pdf" || name.endsWith(".pdf", ignoreCase = true)
 
   private companion object {
     val PROJECTION = arrayOf(

@@ -1,9 +1,9 @@
 # Manga Reader
 
-A simple Android PDF reader for manga and manhwa, built on top of the official
-[MuPDF](https://mupdf.com/) rendering library (not a fork).
+A simple Android manga and manhwa reader for PDF, CBZ and ZIP files, built on
+top of the official [MuPDF](https://mupdf.com/) rendering library (not a fork).
 
-Version: 1.4.0
+Version: 1.6.0
 
 ## Download
 
@@ -24,16 +24,23 @@ Each release includes the APK and the corresponding source archives
 
 - Folder library via SAF: pick a root folder once; browse nested series folders
 - Continuous vertical scrolling, fitted to screen width
+- Reads PDF, CBZ and ZIP; CBZ/ZIP pages use Android image decoding
+  (WebP, JPEG, PNG, GIF, BMP), natural-sorted
 - Immersive top bar: hidden while reading; a single tap shows/hides the chapter
   name and page counter
-- Manual page rotation for sideways PDFs: current page, all pages, or reset
+- Manual page rotation for sideways pages: current page, all pages, or reset
 - Previous / Next chapter actions at the end of a chapter
-- Remembers the last page per PDF; manual open resumes, chapter navigation
+- Remembers the last page per document; manual open resumes, chapter navigation
   starts at page 1
+- Thin progress bars, finished checkmarks, a Continue card, and both
+  per-chapter and per-folder resets
 - "Last read" pill on the most recently opened chapter in each folder
+- Reaching the last page marks a chapter finished automatically
 - Pinch-to-zoom, pan, and double-tap 1x/2x, with resolution-aware re-rendering
 - Right-edge drag scrollbar for fast navigation
 - No INTERNET permission and no analytics; reading progress stays on-device
+
+CBR/RAR, EPUB and TIFF inside archives are not supported.
 
 ## Build
 

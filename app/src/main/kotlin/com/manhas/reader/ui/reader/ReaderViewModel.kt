@@ -6,14 +6,20 @@ import android.net.Uri
 import android.util.LruCache
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.manhas.reader.data.ArchiveSession
+import com.manhas.reader.data.DocumentBackend
+import com.manhas.reader.data.DocumentFormats
+import com.manhas.reader.data.DocumentSession
 import com.manhas.reader.data.LastReadStore
 import com.manhas.reader.data.LibraryEntry
 import com.manhas.reader.data.LibraryRepository
 import com.manhas.reader.data.MuPdfSession
 import com.manhas.reader.data.ProgressStore
+import com.manhas.reader.data.ReadingStateStore
 import com.manhas.reader.data.RotationSettings
 import com.manhas.reader.data.RotationStore
 import com.manhas.reader.util.PageRotation
+import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -38,8 +44,14 @@ data class ReaderUiState(
 
 class ReaderViewModel(private val app: Application) : ViewModel() {
   private val repository = LibraryRepository(app.contentResolver)
-  private val session = MuPdfSession(app.contentResolver)
-  private val progressStore = ProgressStore(app)
+  private val pdfSession = MuPdfSession(app.contentResolver)
+  private val archiveSession = ArchiveSession(
+    resolver = app.contentResolver,
+    cacheDir = File(app.cacheDir, "archives"),
+  )
+  private var activeSession: DocumentSession? = null
+  private val progressStore = ProgressStore.get(app)
+  private val readingStateStore = ReadingStateStore(app)
   private val lastReadStore = LastReadStore(app)
   private val rotationStore = RotationStore(app)
   private val _uiState = MutableStateFlow(ReaderUiState())
@@ -95,6 +107,20 @@ class ReaderViewModel(private val app: Application) : ViewModel() {
 
   fun onPageVisible(page: Int) {
     lastVisiblePage = page.coerceAtLeast(0)
+  }
+
+  /**
+   * Marks the current document finished once its last page is visible.
+   *
+   * The flag is persisted immediately and is sticky: scrolling back does not
+   * clear it, and only the library's reset actions can. No-op until a document
+   * with pages is open.
+   */
+  fun markCurrentDocumentFinished() {
+    val key = currentDocumentKey
+    if (key.isEmpty() || _uiState.value.pageRatios.isEmpty()) return
+    if (readingStateStore.load(key).finished) return
+    readingStateStore.markFinished(key)
   }
 
   /**
@@ -165,7 +191,7 @@ class ReaderViewModel(private val app: Application) : ViewModel() {
     val normalized = PageRotation.normalize(rotation)
     val cacheKey = "$currentDocumentKey:$pageIndex:$widthPx:$normalized"
     cache.get(cacheKey)?.let { return it }
-    val bitmap = session.render(pageIndex, widthPx, normalized) ?: return null
+    val bitmap = activeSession?.render(pageIndex, widthPx, normalized) ?: return null
     cache.put(cacheKey, bitmap)
     return bitmap
   }
@@ -191,12 +217,21 @@ class ReaderViewModel(private val app: Application) : ViewModel() {
       val resolver = app.contentResolver
       val result = runCatching {
         val folderEntries = withContext(Dispatchers.IO) {
-          repository.listPdfs(tree, folderDocumentId)
+          repository.listDocuments(tree, folderDocumentId)
         }
         val size = withContext(Dispatchers.IO) { repository.documentSize(uri) }
         val mimeType = resolver.getType(uri)?.takeIf { it != "application/octet-stream" }
           ?: if (title.endsWith(".pdf", ignoreCase = true)) "application/pdf" else null
-        val ratios = session.open(uri, size, mimeType)
+        val backend = DocumentFormats.backend(title, mimeType)
+        val targetSession = when (backend) {
+          DocumentBackend.ARCHIVE -> archiveSession
+          DocumentBackend.PDF -> pdfSession
+        }
+        if (activeSession !== targetSession) {
+          activeSession?.close()
+          activeSession = targetSession
+        }
+        val ratios = targetSession.open(uri, size, mimeType)
         val rotation = rotationStore.load(documentUri)
         val currentIndex = folderEntries.indexOfFirst { it.documentId == documentId }
         val previous = if (currentIndex > 0) folderEntries.getOrNull(currentIndex - 1) else null
@@ -225,6 +260,7 @@ class ReaderViewModel(private val app: Application) : ViewModel() {
         lastVisiblePage = state.initialPage
         documentRotation = rotation.documentRotation
         pageOverrides = rotation.pageOverrides
+        readingStateStore.recordPageCount(documentUri, state.pageRatios.size)
         lastReadStore.record(tree.toString(), folderDocumentId, documentUri)
         _uiState.value = state
       }.onFailure { error ->
@@ -242,7 +278,10 @@ class ReaderViewModel(private val app: Application) : ViewModel() {
     saveProgressNow()
     openJob?.cancel()
     cache.evictAll()
-    runBlocking(Dispatchers.IO) { session.close() }
+    runBlocking(Dispatchers.IO) {
+      pdfSession.close()
+      archiveSession.close()
+    }
     super.onCleared()
   }
 

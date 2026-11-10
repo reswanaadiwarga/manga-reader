@@ -4,11 +4,13 @@ import android.app.Application
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -18,9 +20,12 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
@@ -31,7 +36,9 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -42,10 +49,11 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.manhas.reader.data.DocumentFormats
 import com.manhas.reader.data.LibraryEntry
 import com.manhas.reader.util.ProgressKey
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun LibraryScreen(
   onOpenDocument: (LibraryEntry, String, String) -> Unit,
@@ -57,10 +65,13 @@ fun LibraryScreen(
     if (uri != null) viewModel.setRoot(uri)
   }
 
+  var chapterActionsFor by remember { mutableStateOf<LibraryEntry?>(null) }
+  var confirmFolderReset by remember { mutableStateOf(false) }
+
   val lifecycleOwner = LocalLifecycleOwner.current
   DisposableEffect(lifecycleOwner) {
     val observer = LifecycleEventObserver { _, event ->
-      if (event == Lifecycle.Event.ON_RESUME) viewModel.refreshLastRead()
+      if (event == Lifecycle.Event.ON_RESUME) viewModel.refresh()
     }
     lifecycleOwner.lifecycle.addObserver(observer)
     onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
@@ -88,6 +99,11 @@ fun LibraryScreen(
           }
         },
         actions = {
+          if (state.entries.any { !it.isDirectory }) {
+            TextButton(onClick = { confirmFolderReset = true }) {
+              Text("Reset")
+            }
+          }
           TextButton(onClick = { picker.launch(null) }) {
             Text("Folder")
           }
@@ -117,13 +133,22 @@ fun LibraryScreen(
         )
 
         state.entries.isEmpty() -> Text(
-          text = "No folders or PDFs here",
+          text = "No folders or readable files here",
           style = MaterialTheme.typography.bodyLarge,
           modifier = Modifier.align(Alignment.Center),
         )
 
         else -> {
           val folderId = state.crumbs.last().documentId
+          // Resolved once per folder/state change so the card does not hash every
+          // row on each recomposition.
+          val lastReadEntry = remember(state.entries, state.lastReadDocumentHash) {
+            state.lastReadDocumentHash?.let { hash ->
+              state.entries.firstOrNull { entry ->
+                !entry.isDirectory && ProgressKey.of(entry.uri.toString()) == hash
+              }
+            }
+          }
           val saved = viewModel.getScroll(folderId)
           val listState = remember(folderId) {
             LazyListState(saved.index, saved.offset)
@@ -137,64 +162,244 @@ fun LibraryScreen(
               )
             }
           }
-          LazyColumn(
-            state = listState,
-            modifier = Modifier.fillMaxSize(),
-            contentPadding = PaddingValues(vertical = 8.dp),
-          ) {
-            items(state.entries, key = { it.documentId }) { entry ->
-              val isLastRead = !entry.isDirectory &&
-                state.lastReadDocumentHash != null &&
-                remember(entry.uri) { ProgressKey.of(entry.uri.toString()) } ==
-                state.lastReadDocumentHash
-              ListItem(
-                modifier = Modifier.clickable {
-                  if (entry.isDirectory) {
-                    viewModel.openFolder(entry)
-                  } else {
-                    onOpenDocument(
-                      entry,
-                      state.rootUri.toString(),
-                      folderId,
-                    )
-                  }
-                },
-                headlineContent = {
-                  Text(
-                    text = entry.name,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                  )
-                },
-                leadingContent = {
-                  Text(
-                    text = if (entry.isDirectory) "DIR" else "PDF",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.primary,
-                  )
-                },
-                trailingContent = {
-                  if (isLastRead) {
-                    Surface(
-                      shape = RoundedCornerShape(50),
-                      color = MaterialTheme.colorScheme.primaryContainer,
-                      contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
-                    ) {
-                      Text(
-                        text = "Last read",
-                        style = MaterialTheme.typography.labelSmall,
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
-                      )
-                    }
-                  }
+          Column(modifier = Modifier.fillMaxSize()) {
+            if (lastReadEntry != null) {
+              ContinueCard(
+                title = lastReadEntry.name,
+                onClick = {
+                  onOpenDocument(lastReadEntry, state.rootUri.toString(), folderId)
                 },
               )
+            }
+            LazyColumn(
+              state = listState,
+              modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth(),
+              contentPadding = PaddingValues(vertical = 8.dp),
+            ) {
+              items(state.entries, key = { it.documentId }) { entry ->
+                val documentHash = remember(entry.uri) {
+                  ProgressKey.of(entry.uri.toString())
+                }
+                val reading = state.readingStates[documentHash]
+                val fraction = reading?.fraction(state.savedPages[documentHash])
+                val finished = reading?.finished == true
+                val isLastRead = !entry.isDirectory &&
+                  state.lastReadDocumentHash != null &&
+                  documentHash == state.lastReadDocumentHash
+                ListItem(
+                  modifier = Modifier.combinedClickable(
+                    onClick = {
+                      if (entry.isDirectory) {
+                        viewModel.openFolder(entry)
+                      } else {
+                        onOpenDocument(
+                          entry,
+                          state.rootUri.toString(),
+                          folderId,
+                        )
+                      }
+                    },
+                    onLongClick = if (entry.isDirectory) {
+                      null
+                    } else {
+                      { chapterActionsFor = entry }
+                    },
+                  ),
+                  headlineContent = {
+                    Text(
+                      text = entry.name,
+                      maxLines = 2,
+                      overflow = TextOverflow.Ellipsis,
+                    )
+                  },
+                  leadingContent = {
+                    Text(
+                      text = DocumentFormats.libraryLabel(entry.name, entry.isDirectory),
+                      style = MaterialTheme.typography.labelMedium,
+                      color = MaterialTheme.colorScheme.primary,
+                    )
+                  },
+                  supportingContent = if (fraction != null) {
+                    {
+                      // Thin determinate bar with no percentage text. It only
+                      // appears once the page count is known.
+                      LinearProgressIndicator(
+                        progress = { fraction },
+                        modifier = Modifier
+                          .fillMaxWidth()
+                          .height(2.dp),
+                        gapSize = 0.dp,
+                        drawStopIndicator = {},
+                      )
+                    }
+                  } else {
+                    null
+                  },
+                  trailingContent = if (finished || isLastRead) {
+                    {
+                      Row(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                      ) {
+                        if (finished) {
+                          Text(
+                            text = "✓",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = MaterialTheme.colorScheme.primary,
+                          )
+                        }
+                        if (isLastRead) {
+                          Surface(
+                            shape = RoundedCornerShape(50),
+                            color = MaterialTheme.colorScheme.primaryContainer,
+                            contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                          ) {
+                            Text(
+                              text = "Last read",
+                              style = MaterialTheme.typography.labelSmall,
+                              modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                            )
+                          }
+                        }
+                      }
+                    }
+                  } else {
+                    null
+                  },
+                )
+              }
             }
           }
         }
       }
     }
   }
+
+  val actionEntry = chapterActionsFor
+  if (actionEntry != null) {
+    ChapterActionsDialog(
+      name = actionEntry.name,
+      onMarkUnread = {
+        chapterActionsFor = null
+        viewModel.markUnread(actionEntry)
+      },
+      onMarkRead = {
+        chapterActionsFor = null
+        viewModel.markRead(actionEntry)
+      },
+      onDismiss = { chapterActionsFor = null },
+    )
+  }
+  if (confirmFolderReset) {
+    FolderResetDialog(
+      onConfirm = {
+        confirmFolderReset = false
+        viewModel.resetCurrentFolder()
+      },
+      onDismiss = { confirmFolderReset = false },
+    )
+  }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ContinueCard(title: String, onClick: () -> Unit) {
+  Card(
+    onClick = onClick,
+    modifier = Modifier
+      .fillMaxWidth()
+      .padding(horizontal = 16.dp, vertical = 8.dp),
+  ) {
+    Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
+      Text(
+        text = "Continue reading",
+        style = MaterialTheme.typography.labelMedium,
+        color = MaterialTheme.colorScheme.primary,
+      )
+      Spacer(modifier = Modifier.height(2.dp))
+      Text(
+        text = title,
+        style = MaterialTheme.typography.titleMedium,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+      )
+    }
+  }
+}
+
+@Composable
+private fun ChapterActionsDialog(
+  name: String,
+  onMarkUnread: () -> Unit,
+  onMarkRead: () -> Unit,
+  onDismiss: () -> Unit,
+) {
+  AlertDialog(
+    onDismissRequest = onDismiss,
+    title = {
+      Text(
+        text = name,
+        maxLines = 2,
+        overflow = TextOverflow.Ellipsis,
+      )
+    },
+    text = {
+      Column {
+        TextButton(
+          onClick = onMarkUnread,
+          modifier = Modifier.fillMaxWidth(),
+        ) {
+          Text(
+            text = "Mark as unread",
+            modifier = Modifier.fillMaxWidth(),
+          )
+        }
+        TextButton(
+          onClick = onMarkRead,
+          modifier = Modifier.fillMaxWidth(),
+        ) {
+          Text(
+            text = "Mark as read",
+            modifier = Modifier.fillMaxWidth(),
+          )
+        }
+      }
+    },
+    confirmButton = {
+      TextButton(onClick = onDismiss) {
+        Text("Cancel")
+      }
+    },
+  )
+}
+
+@Composable
+private fun FolderResetDialog(
+  onConfirm: () -> Unit,
+  onDismiss: () -> Unit,
+) {
+  AlertDialog(
+    onDismissRequest = onDismiss,
+    title = { Text("Reset this folder?") },
+    text = {
+      Text(
+        "Clears saved pages, finished marks, and the Continue card for every " +
+          "chapter directly in this folder. Other folders are untouched.",
+      )
+    },
+    confirmButton = {
+      TextButton(onClick = onConfirm) {
+        Text("Reset")
+      }
+    },
+    dismissButton = {
+      TextButton(onClick = onDismiss) {
+        Text("Cancel")
+      }
+    },
+  )
 }
 
 @Composable
@@ -210,7 +415,8 @@ private fun ChooseFolder(onChoose: () -> Unit, modifier: Modifier = Modifier) {
     )
     Spacer(modifier = Modifier.height(8.dp))
     Text(
-      text = "Pick the root folder that contains your series folders and chapter PDFs.",
+      text = "Pick the root folder that contains your series folders and chapters " +
+        "(PDF, CBZ, or ZIP).",
       style = MaterialTheme.typography.bodyMedium,
     )
     Spacer(modifier = Modifier.height(24.dp))

@@ -4,4 +4,5 @@
     <exclude domain="sharedpref" path="last_read.xml" />
     <exclude domain="sharedpref" path="library.xml" />
     <exclude domain="sharedpref" path="rotation.xml" />
+    <exclude domain="sharedpref" path="reading_state.xml" />
 </full-backup-content>

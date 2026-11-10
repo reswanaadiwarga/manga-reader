@@ -231,6 +231,11 @@ fun ReaderScreen(
         .distinctUntilChanged()
         .collectLatest { page ->
           viewModel.onPageVisible(page)
+          // Auto-finish is sticky; the ViewModel ignores repeats, so scrolling
+          // back to the last page again is harmless.
+          if (pageCount > 0 && page >= pageCount - 1) {
+            viewModel.markCurrentDocumentFinished()
+          }
           delay(700)
           viewModel.saveProgressNow()
         }

@@ -13,12 +13,12 @@ import kotlinx.coroutines.withContext
 import android.graphics.Bitmap
 import kotlin.math.min
 
-class MuPdfSession(private val resolver: ContentResolver) {
+class MuPdfSession(private val resolver: ContentResolver) : DocumentSession {
   private val mutex = Mutex()
   private var document: Document? = null
   private var documentKey: String = ""
 
-  suspend fun open(uri: Uri, size: Long, mimeType: String?): List<Float> = mutex.withLock {
+  override suspend fun open(uri: Uri, size: Long, mimeType: String?): List<Float> = mutex.withLock {
     closeLocked()
     val opened = withContext(Dispatchers.IO) {
       Document.openDocument(ContentInputStream(resolver, uri, size), mimeType)
@@ -55,7 +55,7 @@ class MuPdfSession(private val resolver: ContentResolver) {
    * dimensions and the whole page stays inside the result. Large pages are
    * downscaled (never cropped) to respect [MAX_BITMAP_DIMENSION].
    */
-  suspend fun render(pageIndex: Int, widthPx: Int, rotation: Int = 0): Bitmap? =
+  override suspend fun render(pageIndex: Int, widthPx: Int, rotation: Int): Bitmap? =
     mutex.withLock {
       val doc = document ?: return@withLock null
       withContext(Dispatchers.IO) {
@@ -89,7 +89,7 @@ class MuPdfSession(private val resolver: ContentResolver) {
 
   val key: String get() = documentKey
 
-  suspend fun close() = mutex.withLock { closeLocked() }
+  override suspend fun close() = mutex.withLock { closeLocked() }
 
   private fun closeLocked() {
     document?.destroy()

@@ -9,6 +9,10 @@ import androidx.lifecycle.viewModelScope
 import com.manhas.reader.data.LastReadStore
 import com.manhas.reader.data.LibraryEntry
 import com.manhas.reader.data.LibraryRepository
+import com.manhas.reader.data.ProgressStore
+import com.manhas.reader.data.ReadingState
+import com.manhas.reader.data.ReadingStateStore
+import com.manhas.reader.util.ProgressKey
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -28,12 +32,18 @@ data class LibraryUiState(
   val loading: Boolean = false,
   val error: String? = null,
   val lastReadDocumentHash: String? = null,
+  /** Reading state per document hash for the current folder's direct entries. */
+  val readingStates: Map<String, ReadingState> = emptyMap(),
+  /** Saved page per document hash; zero-based, sourced from [ProgressStore]. */
+  val savedPages: Map<String, Int> = emptyMap(),
 )
 
 class LibraryViewModel(private val app: Application) : ViewModel() {
   private val prefs = app.getSharedPreferences("library", Context.MODE_PRIVATE)
   private val repository = LibraryRepository(app.contentResolver)
   private val lastReadStore = LastReadStore(app)
+  private val progressStore = ProgressStore.get(app)
+  private val readingStateStore = ReadingStateStore(app)
   private val _uiState = MutableStateFlow(LibraryUiState())
   val uiState: StateFlow<LibraryUiState> = _uiState.asStateFlow()
   private val scrollPositions = mutableMapOf<String, ScrollPosition>()
@@ -84,13 +94,78 @@ class LibraryViewModel(private val app: Application) : ViewModel() {
     scrollPositions[documentId] = ScrollPosition(index, offset)
   }
 
-  fun refreshLastRead() {
+  /**
+   * Reloads last-read and reading state for the current folder. Called on
+   * ON_RESUME so progress, finished flags and the Continue card reflect what
+   * happened in the reader.
+   */
+  fun refresh() {
     val state = _uiState.value
     val root = state.rootUri ?: return
     val folder = state.crumbs.lastOrNull() ?: return
     val hash = lastReadStore.documentHash(root.toString(), folder.documentId)
-    if (hash != state.lastReadDocumentHash) {
-      _uiState.update { it.copy(lastReadDocumentHash = hash) }
+    val snapshots = state.entries.filter { !it.isDirectory }.map(::snapshot)
+    _uiState.update {
+      it.copy(
+        lastReadDocumentHash = hash,
+        readingStates = snapshots.associate { snapshot -> snapshot.hash to snapshot.reading },
+        savedPages = snapshots.mapNotNull { snapshot ->
+          snapshot.savedPage?.let { page -> snapshot.hash to page }
+        }.toMap(),
+      )
+    }
+  }
+
+  /**
+   * Clears one direct document's saved page and reading state, so the next open
+   * starts at page 1 and the row loses its bar and checkmark.
+   */
+  fun markUnread(entry: LibraryEntry) {
+    if (entry.isDirectory) return
+    val uri = entry.uri.toString()
+    progressStore.clear(uri)
+    readingStateStore.clear(uri)
+    publishDocument(entry)
+  }
+
+  /**
+   * Marks one direct document finished. When its page count is known the saved
+   * page moves to the last page; otherwise only the finished flag is stored.
+   */
+  fun markRead(entry: LibraryEntry) {
+    if (entry.isDirectory) return
+    val uri = entry.uri.toString()
+    val pageCount = readingStateStore.load(uri).pageCount
+    if (pageCount != null && pageCount > 0) {
+      progressStore.save(uri, pageCount - 1)
+    }
+    readingStateStore.markFinished(uri)
+    publishDocument(entry)
+  }
+
+  /**
+   * Resets the current folder's direct documents: saved pages, finished flags,
+   * and the folder's last-read marker. Sub-folders and other folders are
+   * untouched.
+   */
+  fun resetCurrentFolder() {
+    val state = _uiState.value
+    val root = state.rootUri ?: return
+    val folder = state.crumbs.lastOrNull() ?: return
+    val documents = state.entries.filter { !it.isDirectory }
+    documents.forEach { entry ->
+      val uri = entry.uri.toString()
+      progressStore.clear(uri)
+      readingStateStore.clear(uri)
+    }
+    lastReadStore.clear(root.toString(), folder.documentId)
+    val hashes = documents.mapTo(HashSet()) { ProgressKey.of(it.uri.toString()) }
+    _uiState.update {
+      it.copy(
+        lastReadDocumentHash = null,
+        readingStates = it.readingStates - hashes,
+        savedPages = it.savedPages - hashes,
+      )
     }
   }
 
@@ -117,21 +192,34 @@ class LibraryViewModel(private val app: Application) : ViewModel() {
     viewModelScope.launch {
       _uiState.update { it.copy(loading = true, error = null, entries = emptyList()) }
       val result = runCatching {
-        withContext(Dispatchers.IO) { repository.list(treeUri, folder.documentId) }
+        withContext(Dispatchers.IO) {
+          val entries = repository.list(treeUri, folder.documentId)
+          val snapshots = entries.filter { !it.isDirectory }.map(::snapshot)
+          FolderSnapshot(
+            entries = entries,
+            lastReadDocumentHash = lastReadStore.documentHash(
+              treeUri.toString(),
+              folder.documentId,
+            ),
+            readingStates = snapshots.associate { snapshot -> snapshot.hash to snapshot.reading },
+            savedPages = snapshots.mapNotNull { snapshot ->
+              snapshot.savedPage?.let { page -> snapshot.hash to page }
+            }.toMap(),
+          )
+        }
       }
       _uiState.update { state ->
         result.fold(
-          onSuccess = {
+          onSuccess = { snapshot ->
             state.copy(
               rootUri = treeUri,
               crumbs = crumbs,
-              entries = it,
+              entries = snapshot.entries,
               loading = false,
               error = null,
-              lastReadDocumentHash = lastReadStore.documentHash(
-                treeUri.toString(),
-                folder.documentId,
-              ),
+              lastReadDocumentHash = snapshot.lastReadDocumentHash,
+              readingStates = snapshot.readingStates,
+              savedPages = snapshot.savedPages,
             )
           },
           onFailure = {
@@ -141,6 +229,46 @@ class LibraryViewModel(private val app: Application) : ViewModel() {
       }
     }
   }
+
+  private fun publishDocument(entry: LibraryEntry) {
+    val snapshot = snapshot(entry)
+    _uiState.update {
+      it.copy(
+        readingStates = if (snapshot.reading == ReadingState()) {
+          it.readingStates - snapshot.hash
+        } else {
+          it.readingStates + (snapshot.hash to snapshot.reading)
+        },
+        savedPages = if (snapshot.savedPage != null) {
+          it.savedPages + (snapshot.hash to snapshot.savedPage)
+        } else {
+          it.savedPages - snapshot.hash
+        },
+      )
+    }
+  }
+
+  private fun snapshot(entry: LibraryEntry): DocumentSnapshot {
+    val uri = entry.uri.toString()
+    return DocumentSnapshot(
+      hash = ProgressKey.of(uri),
+      reading = readingStateStore.load(uri),
+      savedPage = progressStore.pageFor(uri),
+    )
+  }
+
+  private data class DocumentSnapshot(
+    val hash: String,
+    val reading: ReadingState,
+    val savedPage: Int?,
+  )
+
+  private data class FolderSnapshot(
+    val entries: List<LibraryEntry>,
+    val lastReadDocumentHash: String?,
+    val readingStates: Map<String, ReadingState>,
+    val savedPages: Map<String, Int>,
+  )
 
   private companion object {
     const val KEY_ROOT = "root_uri"

@@ -5,11 +5,13 @@
         <exclude domain="sharedpref" path="last_read.xml" />
         <exclude domain="sharedpref" path="library.xml" />
         <exclude domain="sharedpref" path="rotation.xml" />
+        <exclude domain="sharedpref" path="reading_state.xml" />
     </cloud-backup>
     <device-transfer>
         <exclude domain="sharedpref" path="progress.xml" />
         <exclude domain="sharedpref" path="last_read.xml" />
         <exclude domain="sharedpref" path="library.xml" />
         <exclude domain="sharedpref" path="rotation.xml" />
+        <exclude domain="sharedpref" path="reading_state.xml" />
     </device-transfer>
 </data-extraction-rules>
