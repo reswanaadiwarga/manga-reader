@@ -92,6 +92,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.launch
 import kotlin.math.abs
 import kotlin.math.max
@@ -227,7 +228,16 @@ fun ReaderScreen(
       }
     }
     LaunchedEffect(listState, state.documentToken) {
-      snapshotFlow { listState.firstVisibleItemIndex }
+      // Progress follows the highest visible page: at the physical bottom the
+      // last page can be fully visible while the penultimate page is still the
+      // first visible item, which would otherwise never reach pageCount - 1.
+      snapshotFlow {
+        lastVisiblePageIndex(
+          listState.layoutInfo.visibleItemsInfo.map { it.index },
+          pageCount,
+        )
+      }
+        .filterNotNull()
         .distinctUntilChanged()
         .collectLatest { page ->
           viewModel.onPageVisible(page)
@@ -698,6 +708,18 @@ private fun ChapterAction(
 }
 
 private const val MAX_RENDER_WIDTH = 2048
+
+/**
+ * Returns the page index used for progress and auto-finish: the highest
+ * visible list index that is an actual page.
+ *
+ * The reader list appends chapter-footer and end-of-document items after the
+ * pages, so their indices are >= [pageCount] and are ignored. Returns null when
+ * no page is visible (empty list, only footer items, or [pageCount] == 0) so
+ * callers can skip the update instead of resetting progress to page 0.
+ */
+internal fun lastVisiblePageIndex(visibleIndices: Iterable<Int>, pageCount: Int): Int? =
+  visibleIndices.filter { it in 0 until pageCount }.maxOrNull()
 
 private class ChromeController(private val scope: CoroutineScope) {
   var visible by mutableStateOf(true)

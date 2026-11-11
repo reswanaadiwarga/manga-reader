@@ -3,7 +3,7 @@
 A simple Android manga and manhwa reader for PDF, CBZ and ZIP files, built on
 top of the official [MuPDF](https://mupdf.com/) rendering library (not a fork).
 
-Version: 1.7.0
+Version: 1.7.1
 
 ## Download
 
