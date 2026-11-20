@@ -27,6 +27,23 @@ interface DocumentSession {
    */
   suspend fun render(pageIndex: Int, widthPx: Int, rotation: Int = 0): Bitmap?
 
+  /**
+   * Renders the vertical fraction of [pageIndex]'s rotated page that starts at
+   * [topFraction] and spans [heightFraction], both in 0..1 of the page height,
+   * fit to [widthPx] wide.
+   *
+   * Returns null when the backend cannot tile (the default), when the
+   * fractions are invalid, or when the requested bitmap would exceed the
+   * backend's safety limit. Callers fall back to [render] in that case.
+   */
+  suspend fun renderBand(
+    pageIndex: Int,
+    widthPx: Int,
+    rotation: Int,
+    topFraction: Float,
+    heightFraction: Float,
+  ): Bitmap? = null
+
   /** Releases the open document; safe to call repeatedly. */
   suspend fun close()
 }

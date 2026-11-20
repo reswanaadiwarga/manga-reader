@@ -63,6 +63,7 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.TransformOrigin
@@ -93,6 +94,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlin.math.abs
 import kotlin.math.max
@@ -105,6 +107,7 @@ fun ReaderScreen(
   onBack: () -> Unit,
 ) {
   val app = LocalContext.current.applicationContext as Application
+  val budget = remember(app) { ReaderRenderBudget.create(app) }
   val viewModel: ReaderViewModel = viewModel { ReaderViewModel(app) }
   val state by viewModel.uiState.collectAsStateWithLifecycle()
   val chromeScope = rememberCoroutineScope()
@@ -177,6 +180,14 @@ fun ReaderScreen(
       offsets
     }
     val viewportHeightPx = with(density) { maxHeight.toPx() }
+    // Content-space top of the viewport. Zoom scales and translates the whole
+    // list, so the visible band must be mapped back through the same transform.
+    val viewportContentTopPx by remember(pageOffsets, pageCount, listState) {
+      derivedStateOf {
+        val index = listState.firstVisibleItemIndex.coerceAtMost(pageCount)
+        pageOffsets[index] + listState.firstVisibleItemScrollOffset
+      }
+    }
     val contentHeightPx = with(density) {
       pageOffsets.last().toFloat() +
         (if (state.nextTitle != null) 280.dp else 80.dp).toPx() +
@@ -188,7 +199,8 @@ fun ReaderScreen(
     zoom.viewportHeight = viewportHeightPx
     var renderScale by remember { mutableFloatStateOf(1f) }
     val zoomed = zoom.scale > 1.001f
-    val renderWidthPx = (widthPx * renderScale).roundToInt().coerceIn(1, MAX_RENDER_WIDTH)
+    val maxRenderWidth = maxOf(budget.maxZoomRenderWidth, widthPx)
+    val renderWidthPx = (widthPx * renderScale).roundToInt().coerceIn(1, maxRenderWidth)
 
     LaunchedEffect(state.documentToken) {
       zoom.reset()
@@ -297,14 +309,27 @@ fun ReaderScreen(
         contentPadding = PaddingValues(bottom = bottomInset + 16.dp),
       ) {
         itemsIndexed(displayRatios) { index, ratio ->
+          val pageTop = pageOffsets[index]
+          val pageHeight = pageOffsets[index + 1] - pageTop
+          val contentTop = viewportContentTopPx - zoom.offset.y / zoom.scale
+          val contentHeight = viewportHeightPx / zoom.scale
+          val visibleTop = (contentTop - pageTop).coerceIn(0f, pageHeight.toFloat())
+          val visibleBottom = (contentTop + contentHeight - pageTop)
+            .coerceIn(0f, pageHeight.toFloat())
           ReaderPage(
             index = index,
             ratio = ratio,
             rotation = state.pageRotations.getOrElse(index) { 0 },
             widthDp = widthDp,
             renderWidthPx = renderWidthPx,
+            pageWidthPx = widthPx,
+            pageHeightPx = pageHeight,
+            visibleTopPx = visibleTop,
+            visibleHeightPx = visibleBottom - visibleTop,
+            budget = budget,
             documentToken = state.documentToken,
             render = viewModel::renderPage,
+            renderBand = viewModel::renderBand,
           )
         }
         val previousTitle = state.previousTitle
@@ -586,21 +611,87 @@ private fun ReaderPage(
   rotation: Int,
   widthDp: Dp,
   renderWidthPx: Int,
+  pageWidthPx: Int,
+  pageHeightPx: Int,
+  visibleTopPx: Float,
+  visibleHeightPx: Float,
+  budget: ReaderRenderBudget,
   documentToken: Int,
   render: suspend (Int, Int, Int) -> Bitmap?,
+  renderBand: suspend (Int, Int, Int, Float, Float) -> Bitmap?,
 ) {
+  val density = LocalDensity.current
   var bitmap by remember(index, documentToken, rotation) { mutableStateOf<Bitmap?>(null) }
+  var tile by remember(index, documentToken, rotation) { mutableStateOf<TileFrame?>(null) }
   LaunchedEffect(index, renderWidthPx, documentToken, rotation) {
     val next = render(index, renderWidthPx, rotation)
     if (next != null) {
       bitmap = next
     }
   }
+
+  // Only overlay a tile when the base bitmap is actually capped and the tile
+  // would be meaningfully wider than it. A narrower tile would make the
+  // visible band blurrier, not sharper, so the base is kept in that case.
+  val baseWidth = baseRenderWidth(pageHeightPx, pageWidthPx, renderWidthPx, budget)
+  val needsTile = baseWidth in 1 until renderWidthPx
+  val candidateTileWidth = if (needsTile) {
+    tileRenderWidth(
+      visibleHeightPx = visibleHeightPx.roundToInt(),
+      pageHeightPx = pageHeightPx,
+      pageWidthPx = pageWidthPx,
+      requestedWidthPx = renderWidthPx,
+      budget = budget,
+    )
+  } else {
+    0
+  }
+  // Require at least a 2 px gain so a barely-wider tile never replaces the base.
+  val tileWidth = if (candidateTileWidth > baseWidth + 1) candidateTileWidth else 0
+  val band = if (tileWidth > 0) {
+    tileBand(
+      visibleTopPx = visibleTopPx.roundToInt(),
+      visibleHeightPx = visibleHeightPx.roundToInt(),
+      pageHeightPx = pageHeightPx,
+      pageWidthPx = pageWidthPx,
+      renderWidthPx = tileWidth,
+      budget = budget,
+    )
+  } else {
+    null
+  }
+  LaunchedEffect(
+    index,
+    documentToken,
+    rotation,
+    tileWidth,
+    band?.topPx,
+    band?.heightPx,
+  ) {
+    if (band == null) {
+      // Offscreen or no longer tile-worthy: drop the sharp bitmap so only
+      // visible pages hold a tile.
+      tile = null
+      return@LaunchedEffect
+    }
+    val next = renderBand(
+      index,
+      tileWidth,
+      rotation,
+      band.topPx.toFloat() / pageHeightPx,
+      band.heightPx.toFloat() / pageHeightPx,
+    )
+    if (next != null && isActive) {
+      tile = TileFrame(next, band.topPx, band.heightPx)
+    }
+  }
+
   Box(
     modifier = Modifier
       .fillMaxWidth()
       .height(widthDp * ratio)
-      .background(Color.White),
+      .background(Color.White)
+      .clipToBounds(),
     contentAlignment = Alignment.Center,
   ) {
     val rendered = bitmap
@@ -625,8 +716,28 @@ private fun ReaderPage(
         )
       }
     }
+    val frame = tile
+    if (frame != null) {
+      Image(
+        bitmap = frame.bitmap.asImageBitmap(),
+        contentDescription = null,
+        modifier = Modifier
+          .align(Alignment.TopStart)
+          .offset(y = with(density) { frame.topPx.toDp() })
+          .fillMaxWidth()
+          .height(with(density) { frame.heightPx.toDp() }),
+        contentScale = ContentScale.FillBounds,
+      )
+    }
   }
 }
+
+/** One rendered sharp band, positioned in page display pixels. */
+private data class TileFrame(
+  val bitmap: Bitmap,
+  val topPx: Int,
+  val heightPx: Int,
+)
 
 @Composable
 private fun ChapterFooter(
@@ -706,8 +817,6 @@ private fun ChapterAction(
     }
   }
 }
-
-private const val MAX_RENDER_WIDTH = 2048
 
 /**
  * Returns the page index used for progress and auto-finish: the highest

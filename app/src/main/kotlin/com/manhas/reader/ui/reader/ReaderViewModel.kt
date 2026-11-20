@@ -16,6 +16,7 @@ import com.manhas.reader.data.LibraryRepository
 import com.manhas.reader.data.MuPdfSession
 import com.manhas.reader.data.ProgressStore
 import com.manhas.reader.data.ReadingStateStore
+import com.manhas.reader.data.ReaderRenderLimits
 import com.manhas.reader.data.RotationSettings
 import com.manhas.reader.data.RotationStore
 import com.manhas.reader.util.PageRotation
@@ -44,10 +45,17 @@ data class ReaderUiState(
 
 class ReaderViewModel(private val app: Application) : ViewModel() {
   private val repository = LibraryRepository(app.contentResolver)
-  private val pdfSession = MuPdfSession(app.contentResolver)
+  private val renderBudget = ReaderRenderBudget.create(app)
+  private val pdfSession = MuPdfSession(
+    app.contentResolver,
+    renderBudget.pagePixels.toLong(),
+    ReaderRenderLimits.MAX_PAGE_DIMENSION,
+  )
   private val archiveSession = ArchiveSession(
     resolver = app.contentResolver,
     cacheDir = File(app.cacheDir, "archives"),
+    maxPagePixels = renderBudget.pagePixels.toLong(),
+    maxPageDimension = ReaderRenderLimits.MAX_PAGE_DIMENSION,
   )
   private var activeSession: DocumentSession? = null
   private val progressStore = ProgressStore.get(app)
@@ -195,6 +203,21 @@ class ReaderViewModel(private val app: Application) : ViewModel() {
     cache.put(cacheKey, bitmap)
     return bitmap
   }
+
+  /**
+   * Renders the vertical band of [pageIndex] that starts at [topFraction] and
+   * spans [heightFraction] of the page at [widthPx]. Tiles are not cached: they
+   * are short-lived and scoped to the current viewport, so the session renders
+   * them on demand. Returns null when the backend cannot tile.
+   */
+  suspend fun renderBand(
+    pageIndex: Int,
+    widthPx: Int,
+    rotation: Int,
+    topFraction: Float,
+    heightFraction: Float,
+  ): Bitmap? =
+    activeSession?.renderBand(pageIndex, widthPx, rotation, topFraction, heightFraction)
 
   private fun open(documentUri: String, documentId: String, title: String, resume: Boolean) {
     val tree = treeUri ?: return

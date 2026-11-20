@@ -75,4 +75,42 @@ class ArchiveGeometryTest {
     assertNull(ArchiveGeometry.target(100, 0, 300, 0))
     assertNull(ArchiveGeometry.target(-1, 150, 300, 0))
   }
+
+  @Test
+  fun pixelBudgetCapsTheTargetLikeThePdfSession() {
+    val target = ArchiveGeometry.target(
+      pageWidth = 4000,
+      pageHeight = 6000,
+      widthPx = 4000,
+      rotation = 0,
+      maxPagePixels = 6_000_000,
+    )!!
+
+    // sqrt(6M / 24M) = 0.5, so the 4000 x 6000 target becomes 2000 x 3000.
+    assertEquals(2000, target.width)
+    assertEquals(3000, target.height)
+    assertEquals(2, target.sampleSize)
+  }
+
+  @Test
+  fun dimensionBudgetCapsTheTarget() {
+    val target = ArchiveGeometry.target(
+      pageWidth = 4000,
+      pageHeight = 6000,
+      widthPx = 4000,
+      rotation = 0,
+      maxPageDimension = 3000f,
+    )!!
+
+    assertEquals(2000, target.width)
+    assertEquals(3000, target.height)
+  }
+
+  @Test
+  fun defaultBudgetsLeaveTheTargetUncapped() {
+    val target = ArchiveGeometry.target(4000, 6000, 4000, 0)!!
+
+    assertEquals(4000, target.width)
+    assertEquals(6000, target.height)
+  }
 }
